@@ -3,6 +3,7 @@
 CREATE TABLE payments(
     id SERIAL PRIMARY KEY,
     idempotency_key TEXT NOT NULL,
-    amount NUMERIC(10, 2) NOT NULL,
-    CONSTRAINT payments_key_unique UNIQUE (idempotency_key)
+    amount NUMERIC(10, 2) NOT NULL
 );
+
+ALTER TABLE payments ADD CONSTRAINT payments_key_unique UNIQUE (idempotency_key);
