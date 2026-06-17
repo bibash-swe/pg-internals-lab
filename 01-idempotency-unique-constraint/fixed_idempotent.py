@@ -21,7 +21,7 @@ async def create_payment(db: asyncpg.Connection, key: str, amount: float):
         if existing is not None:
             return existing
 
-        # The confliction transaction is rolled back.
+        # The conflicting transaction was rolled back.
         # We are now the only writer for this key, safe to retry.
         return await db.fetchrow(
             "INSERT INTO payments (idempotency_key, amount) VALUES ($1, $2) RETURNING *", key, amount
