@@ -10,6 +10,8 @@
 -- and both commit — leaving zero doctors on call, even though each
 -- individual transaction's logic was locally correct.
 
+DROP TABLE IF EXISTS on_call;
+
 CREATE TABLE on_call (
     id SERIAL PRIMARY KEY,
     doctor TEXT NOT NULL,
@@ -20,7 +22,8 @@ INSERT INTO on_call (doctor, is_on_call) VALUES
     ('Alice', true),
     ('Bob', true);
 
--- Reproduce the anomaly (see experiment.md for full transcript):
+-- Reproduce the anomaly manually (see experiment.md for full transcript),
+-- or run test_write_skew.py for an automated, repeatable version:
 
 -- Terminal A:
 --   BEGIN ISOLATION LEVEL SERIALIZABLE;
