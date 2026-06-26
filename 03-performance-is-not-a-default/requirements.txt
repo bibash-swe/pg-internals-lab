@@ -1,0 +1,20 @@
+# Core database driver
+asyncpg
+
+# FastAPI for experiment 04 (connection pooling endpoint)
+# and experiment 05 (N+1 detection)
+fastapi
+uvicorn[standard]
+
+# HTTP client for load simulation in benchmark scripts
+# (k6 handles the real load test, httpx used for health checks)
+httpx
+
+# Data generation for seed scripts
+faker
+
+# Numerical operations and percentile reporting
+numpy
+
+# pgvector Python client for experiment 03 (HNSW)
+pgvector
