@@ -4,9 +4,6 @@ Experiment 01: Index Types Benchmark
 Generates 1,000,000 realistic job listing rows and streams them directly
 into the database using an asynchronous generator and the COPY protocol.
 This ensures a near-zero memory footprint during bulk load.
-
-Run:
-    python seed.py
 """
 import asyncio
 import os
@@ -61,7 +58,6 @@ DESCRIPTIONS = [
     "Improve developer experience across our entire microservices ecosystem.",
 ]
 
-
 async def generate_rows_stream():
     """Asynchronous generator yielding rows with near-zero memory footprint."""
     base_date = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -71,7 +67,6 @@ async def generate_rows_stream():
         salary_max = salary_min + random.choice([20, 30, 40, 50]) * 1000
         num_tags = random.randint(2, 6)
         row_tags = random.sample(TAGS, num_tags)
-
         # Chronological distribution: spreads 1M rows perfectly over ~5 years
         created_at = base_date + timedelta(days=i * 1825 // TOTAL_ROWS)
 
@@ -87,11 +82,9 @@ async def generate_rows_stream():
             random.choice(DESCRIPTIONS),        # description
         )
 
-
 async def seed():
     print(f"Connecting to {DATABASE_URL}")
 
-    # Robust resource management using async connection pools
     async with asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5) as pool:
         async with pool.acquire() as conn:
 
@@ -112,7 +105,6 @@ async def seed():
             print(f"Streaming {TOTAL_ROWS:,} rows into database...")
             start = time.perf_counter()
 
-            # Natively consume the async generator
             await conn.copy_records_to_table(
                 "job_listings",
                 records=generate_rows_stream(),
@@ -168,18 +160,6 @@ async def seed():
                 await conn.execute(sql)
                 t1 = time.perf_counter()
                 print(f"  {name}: {t1 - t0:.2f}s — {description}")
-
-            print("\nIndex sizes:")
-            rows = await conn.fetch("""
-                SELECT indexname,
-                       pg_size_pretty(pg_relation_size(indexname::regclass)) AS size
-                FROM pg_indexes
-                WHERE tablename = 'job_listings'
-                ORDER BY pg_relation_size(indexname::regclass) DESC
-            """)
-            for row in rows:
-                print(f"  {row['indexname']:<30} {row['size']}")
-
 
 if __name__ == "__main__":
     asyncio.run(seed())
