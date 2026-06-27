@@ -2,8 +2,8 @@
 Experiment 01: Index Types Benchmark
 
 Runs a representative query for each index type against the job_listings table.
-Enforces a mathematically honest cold cache prior to execution using the
-pg_prewarm extension to dynamically evict heap and index pages.
+Enforces a mathematically honest cold cache prior to execution by physically
+thrashing the LRU cache, forcing the database to read from disk.
 """
 import asyncio
 import os
@@ -55,32 +55,23 @@ async def time_query_percentiles(conn, query: str, params=None) -> dict:
 
 async def clear_cache(conn):
     """
-    True cold cache simulation via LRU Eviction.
-    Since standard PostgreSQL does not natively support an 'evict' command,
-    we mathematically force the database to evict 'job_listings' by thrashing
-    the cache. We create and scan a temporary table larger than our
-    256MB shared_buffers limit.
+    True cold cache simulation via LRU Eviction (Buffer Thrashing).
+    We create and scan a temporary table roughly ~300MB in size to force
+    PostgreSQL to evict the existing job_listings heap and index pages.
     """
-    # 1. Reset query statistics
     await conn.execute("SELECT pg_stat_reset()")
 
-    # 2. Thrash the buffer cache to force LRU eviction
-    # 3,000,000 rows with a couple of MD5 hashes generates ~300MB+ of data.
-    # Reading this forces Postgres to drop older pages from shared_buffers.
-    await conn.execute("""
-        CREATE TEMP TABLE cache_thrash AS
-        SELECT generate_series(1, 3000000) AS id,
-               md5(random()::text) AS junk1,
-               md5(random()::text) AS junk2
-    """)
-
-    # Force the database to read these new pages into memory
-    await conn.execute("SELECT count(*) FROM cache_thrash")
-
-    # Drop the temp table to free up the space for the actual benchmark query
-    await conn.execute("DROP TABLE cache_thrash")
-
-    print("  [Cache explicitly evicted via buffer thrashing (LRU flush)]")
+    async with conn.transaction():
+        await conn.execute("""
+            CREATE TEMP TABLE cache_thrash ON COMMIT DROP AS
+            SELECT generate_series(1, 3000000) AS id,
+                   md5(random()::text) AS junk1,
+                   md5(random()::text) AS junk2
+        """)
+        # Force the database to pull these new pages into shared_buffers
+        await conn.execute("SELECT count(*) FROM cache_thrash")
+        # The transaction closes here, and Postgres automatically drops cache_thrash.
+    print("  [Cache explicitly evicted via transactional buffer thrashing]")
 
 
 async def run_scenario(conn, name: str, description: str, query: str,
@@ -136,12 +127,9 @@ async def main():
             results = []
 
             count = await conn.fetchval("SELECT COUNT(*) FROM job_listings")
-            print(f"\nTable: job_listings ({count:,} rows)")
+            size = await conn.fetchval("SELECT pg_size_pretty(pg_total_relation_size('job_listings'))")
 
-            size = await conn.fetchval(
-                "SELECT pg_size_pretty(pg_total_relation_size('job_listings'))"
-            )
-            print(f"Total size on disk: {size}")
+            print(f"\nTable: job_listings ({count:,} rows, {size})")
 
             # Scenarios
             results.append(await run_scenario(
@@ -184,7 +172,7 @@ async def main():
                 name="3b. B-tree on company_id (same equality query)",
                 description="Direct comparison: B-tree vs Hash for equality.",
                 query="SELECT id, title, salary_min FROM job_listings WHERE company_id = 42",
-                drop_sql="DROP INDEX IF EXISTS idx_company_hash",
+                drop_sql="DROP INDEX IF EXISTS idx_company_btree_cmp;",
                 create_sql="CREATE INDEX idx_company_btree_cmp ON job_listings (company_id)",
             ))
 
@@ -269,7 +257,7 @@ async def write_results_md(results: list, row_count: int):
         f"**Run at:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"**Warm cache repetitions:** {REPEAT} (p50/p95/p99 exclude first run)",
         "",
-        "Cold cache = first execution after cache eviction via `pg_prewarm`.",
+        "Cold cache = first execution after mathematically forcing LRU buffer eviction.",
         "Warm cache = subsequent executions (data in shared_buffers).",
         "",
         "---",
