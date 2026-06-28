@@ -98,59 +98,68 @@ async def seed():
                 return
 
             count = await conn.fetchval("SELECT COUNT(*) FROM job_listings")
+
+            if 0 < count < TOTAL_ROWS:
+                print(
+                    f"Found {count:,} rows (expected {TOTAL_ROWS:,}) — "
+                    f"looks like a previous run was interrupted mid-load. "
+                    f"Truncating before reseeding."
+                )
+                await conn.execute("TRUNCATE TABLE job_listings")
+                count = 0
+
             if count >= TOTAL_ROWS:
-                print(f"Table already has {count:,} rows. Skipping seed.")
-                return
+                print(f"Table already has {count:,} rows. Skipping seed step.")
+            else:
+                print(f"Streaming {TOTAL_ROWS:,} rows into database...")
+                start = time.perf_counter()
 
-            print(f"Streaming {TOTAL_ROWS:,} rows into database...")
-            start = time.perf_counter()
+                await conn.copy_records_to_table(
+                    "job_listings",
+                    records=generate_rows_stream(),
+                    columns=[
+                        "company_id", "title", "location",
+                        "salary_min", "salary_max", "tags",
+                        "is_active", "created_at", "description"
+                    ]
+                )
 
-            await conn.copy_records_to_table(
-                "job_listings",
-                records=generate_rows_stream(),
-                columns=[
-                    "company_id", "title", "location",
-                    "salary_min", "salary_max", "tags",
-                    "is_active", "created_at", "description"
-                ]
-            )
+                elapsed = time.perf_counter() - start
+                final_count = await conn.fetchval("SELECT COUNT(*) FROM job_listings")
+                print(f"\nSeeded {final_count:,} rows in {elapsed:.1f}s "
+                      f"({final_count / elapsed:,.0f} rows/sec)")
 
-            elapsed = time.perf_counter() - start
-            final_count = await conn.fetchval("SELECT COUNT(*) FROM job_listings")
-            print(f"\nSeeded {final_count:,} rows in {elapsed:.1f}s "
-                  f"({final_count / elapsed:,.0f} rows/sec)")
-
-            size = await conn.fetchval(
-                "SELECT pg_size_pretty(pg_total_relation_size('job_listings'))"
-            )
-            print(f"Table size on disk: {size}")
+                size = await conn.fetchval(
+                    "SELECT pg_size_pretty(pg_total_relation_size('job_listings'))"
+                )
+                print(f"Table size on disk: {size}")
 
             print("\nBuilding indexes after bulk load (correct pattern)...")
 
             indexes = [
                 (
                     "idx_salary_btree",
-                    "CREATE INDEX idx_salary_btree ON job_listings (salary_min)",
+                    "CREATE INDEX IF NOT EXISTS idx_salary_btree ON job_listings (salary_min)",
                     "B-tree on salary_min — range queries"
                 ),
                 (
                     "idx_company_hash",
-                    "CREATE INDEX idx_company_hash ON job_listings USING hash (company_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_company_hash ON job_listings USING hash (company_id)",
                     "Hash on company_id — pure equality"
                 ),
                 (
                     "idx_tags_gin",
-                    "CREATE INDEX idx_tags_gin ON job_listings USING gin (tags)",
+                    "CREATE INDEX IF NOT EXISTS idx_tags_gin ON job_listings USING gin (tags)",
                     "GIN on tags array — contains queries"
                 ),
                 (
                     "idx_created_brin",
-                    "CREATE INDEX idx_created_brin ON job_listings USING brin (created_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_created_brin ON job_listings USING brin (created_at)",
                     "BRIN on created_at — range on append-ordered column"
                 ),
                 (
                     "idx_salary_covering",
-                    "CREATE INDEX idx_salary_covering ON job_listings (salary_min) INCLUDE (title, location)",
+                    "CREATE INDEX IF NOT EXISTS idx_salary_covering ON job_listings (salary_min) INCLUDE (title, location)",
                     "Covering index — index-only scan without heap visit"
                 ),
             ]
