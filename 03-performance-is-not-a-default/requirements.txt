@@ -18,3 +18,5 @@ numpy
 
 # pgvector Python client for experiment 03 (HNSW)
 pgvector
+
+python-dotenv
