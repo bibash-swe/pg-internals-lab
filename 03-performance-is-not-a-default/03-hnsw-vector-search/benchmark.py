@@ -1,45 +1,42 @@
 """
-Three things measured, in this order, matching the established
-discipline of this lab series (baseline first, then real parameter
-sweep, then verified proof -- not an assumed one):
+Three things measured, in this order:
 
   1. BRUTE FORCE GROUND TRUTH (before any index exists):
-     For a fixed set of test queries, compute the TRUE top-10 nearest
-     neighbors via exact cosine distance, sequential scan, no index.
-     This is the ground truth every HNSW result gets compared against.
+     Exact top-10 nearest neighbors via full cosine distance
+     computation, sequential scan, no index.
 
   2. HNSW BUILD-TIME PARAMETER SWEEP (m, ef_construction):
-     Higher m and ef_construction should mean a more thorough,
-     more expensive index build, trading build time and index size
-     for potentially better recall. This is measured, not assumed.
+     Build time, index size, and downstream recall/latency at each
+     configuration.
 
   3. HNSW RUNTIME PARAMETER SWEEP (ef_search):
-     Independent of how the index was built, ef_search is a
-     per-query knob controlling how much of the graph HNSW explores
-     at search time. Same index, different ef_search values, trades
-     query latency for recall -- live, without rebuilding anything.
+     Same index, different ef_search values -- trades query latency
+     for recall live, without rebuilding anything.
 
-RECALL, DEFINED PRECISELY:
-    For a single query, recall@10 = |HNSW's top-10 result IDs
-    intersected with the true top-10 IDs| / 10. This is computed for
-    every test query at every (m, ef_construction, ef_search)
-    combination and averaged. This is the number that answers "how
-    approximate is HNSW, really, at this setting" -- not a claim,
-    a measurement.
+A REAL BUG FOUND AND FIXED DURING THIS EXPERIMENT -- WORTH READING:
+    An earlier version of this benchmark showed a confirmed exact
+    sequential scan producing only ~58-61% recall against its own
+    ground truth on some runs, and 100% on others, with no code
+    changed in between. An exact scan disagreeing with its own
+    ground truth is only possible one way: `ORDER BY embedding <=>
+    (...)` had no secondary sort key. This dataset's synthetic text
+    is built from only 5 templates per category, producing many rows
+    with identical or near-identical cosine distance to any given
+    query. Without a deterministic tiebreak, PostgreSQL makes no
+    promise about which tied row comes first -- so two "exact"
+    executions of the same logical query could legitimately return
+    different (but equally valid) top-10 sets. Both queries below
+    now sort by `, id` as a secondary key, making ties -- and
+    therefore recall comparisons -- fully reproducible.
 
-WHY QUERIES REFERENCE AN EXISTING ROW'S EMBEDDING, NOT A FRESH VECTOR:
-    Each test query is "find articles similar to article X, excluding
-    X itself" -- a real, common production pattern (ticket
-    deflection: given this ticket, find similar past tickets). This
-    avoids needing extra API calls to embed synthetic query text,
-    while still being a completely valid nearest-neighbor search
-    against real embeddings.
+    ANALYZE after CREATE INDEX is also kept, since a freshly built
+    index without updated statistics can cause inconsistent plan
+    choices -- the same stale-statistics mechanism proven in
+    Experiment 01 -- but the tiebreak, not ANALYZE, is what actually
+    resolves the exact-scan self-disagreement described above.
 
 Run:
     python benchmark.py
-
-Requires support_articles fully seeded (see seed.py) with a
-representative row count.
 """
 import asyncio
 import os
@@ -61,8 +58,6 @@ DATABASE_URL = os.getenv(
 NUM_TEST_QUERIES = 50
 TOP_K = 10
 
-# Build-time parameter sweep. Higher values = more thorough (and
-# expensive) index construction.
 HNSW_CONFIGS = [
     {"m": 8, "ef_construction": 64},
     {"m": 16, "ef_construction": 64},
@@ -70,8 +65,6 @@ HNSW_CONFIGS = [
     {"m": 32, "ef_construction": 200},
 ]
 
-# Runtime parameter sweep. Independent of build parameters -- tested
-# against EVERY built index above, since it's a live, per-query knob.
 EF_SEARCH_VALUES = [40, 100, 200]
 
 
@@ -85,25 +78,35 @@ async def get_test_query_ids(conn: asyncpg.Connection) -> list[int]:
 
 async def brute_force_top_k(conn: asyncpg.Connection, query_id: int) -> list[int]:
     """
-    Exact nearest neighbors via full cosine distance computation
-    against every row -- no index involved. This is the ground truth
-    every approximate HNSW result is measured against.
+    Exact nearest neighbors via full cosine distance computation.
+    `, id` is a DETERMINISTIC TIEBREAK -- without it, rows with equal
+    or near-equal cosine distance (common in this dataset, built from
+    only 5 templates per category) can be returned in a different
+    order across separate executions of this same logical query,
+    even though each execution is individually "correct." This is
+    the fix for the exact-scan self-disagreement described in the
+    module docstring.
     """
     rows = await conn.fetch(f"""
         SELECT id FROM support_articles
         WHERE id != $1
-        ORDER BY embedding <=> (SELECT embedding FROM support_articles WHERE id = $1)
+        ORDER BY embedding <=> (SELECT embedding FROM support_articles WHERE id = $1), id
         LIMIT {TOP_K}
     """, query_id)
     return [r["id"] for r in rows]
 
 
 async def hnsw_top_k(conn: asyncpg.Connection, query_id: int) -> list[int]:
-    """Same query, now serviced by whichever HNSW index currently exists."""
+    """
+    Same query, same deterministic tiebreak, now serviced by
+    whichever HNSW index currently exists (or by a planner-chosen
+    sequential scan, if the planner judges the index not worth
+    using -- see the m=8 finding in result_analysis.md).
+    """
     rows = await conn.fetch(f"""
         SELECT id FROM support_articles
         WHERE id != $1
-        ORDER BY embedding <=> (SELECT embedding FROM support_articles WHERE id = $1)
+        ORDER BY embedding <=> (SELECT embedding FROM support_articles WHERE id = $1), id
         LIMIT {TOP_K}
     """, query_id)
     return [r["id"] for r in rows]
@@ -156,7 +159,12 @@ async def build_hnsw_index(conn: asyncpg.Connection, m: int, ef_construction: in
         WITH (m = {m}, ef_construction = {ef_construction})
     """)
     build_time_sec = time.perf_counter() - t0
-    await conn.execute("ANALYZE support_articles;")
+
+    # See module docstring: this alone does not fix the tiebreak
+    # issue, but is kept since it is still correct, standard practice
+    # after building any new index.
+    await conn.execute("ANALYZE support_articles")
+
     size = await conn.fetchval(
         "SELECT pg_size_pretty(pg_relation_size('idx_support_embedding_hnsw'))"
     )
@@ -173,24 +181,27 @@ async def build_hnsw_index(conn: asyncpg.Connection, m: int, ef_construction: in
     }
 
 
-async def verify_index_is_used(conn: asyncpg.Connection, query_id: int):
+async def verify_index_is_used(conn: asyncpg.Connection, query_id: int) -> bool:
     """
-    One explicit check that the HNSW index is actually being chosen
-    by the planner -- not assumed. Printed once per config, not in
-    the timing loop, so it doesn't distort latency measurements.
+    Explicit check of whether the planner actually chose the HNSW
+    index -- not assumed. Also reveals a genuine, separate finding:
+    at low m, the planner may judge the index not worth using at
+    all, regardless of ef_search, and correctly fall back to an
+    exact sequential scan.
     """
     plan_rows = await conn.fetch(f"""
         EXPLAIN SELECT id FROM support_articles
         WHERE id != {query_id}
-        ORDER BY embedding <=> (SELECT embedding FROM support_articles WHERE id = {query_id})
+        ORDER BY embedding <=> (SELECT embedding FROM support_articles WHERE id = {query_id}), id
         LIMIT {TOP_K}
     """)
     plan_text = "\n".join(r[0] for r in plan_rows)
     uses_hnsw = "idx_support_embedding_hnsw" in plan_text
     print(f"  Index verification: "
-          f"{'HNSW index confirmed in use' if uses_hnsw else 'WARNING -- HNSW index NOT used, check plan'}")
+          f"{'HNSW index confirmed in use' if uses_hnsw else 'Planner chose sequential scan instead (see result_analysis.md)'}")
     if not uses_hnsw:
         print(f"  Plan was:\n{plan_text}")
+    return uses_hnsw
 
 
 async def run_hnsw_sweep(conn: asyncpg.Connection, query_ids: list[int],
@@ -206,7 +217,7 @@ async def run_hnsw_sweep(conn: asyncpg.Connection, query_ids: list[int],
         print(f"  Build time: {build_info['build_time_sec']}s")
         print(f"  Index size: {build_info['size_pretty']}")
 
-        await verify_index_is_used(conn, query_ids[0])
+        index_used = await verify_index_is_used(conn, query_ids[0])
 
         for ef_search in EF_SEARCH_VALUES:
             await conn.execute(f"SET hnsw.ef_search = {ef_search}")
@@ -237,6 +248,7 @@ async def run_hnsw_sweep(conn: asyncpg.Connection, query_ids: list[int],
                 "build_time_sec": build_info["build_time_sec"],
                 "index_size_pretty": build_info["size_pretty"],
                 "index_size_bytes": build_info["size_bytes"],
+                "index_used": index_used,
                 "latency": perf,
                 "recall": avg_recall,
             })
@@ -273,14 +285,14 @@ async def main():
         print()
         header = (f"{'m':>4} {'ef_constr':>10} {'ef_search':>10} "
                   f"{'build(s)':>9} {'size':>10} {'p50(ms)':>9} "
-                  f"{'p95(ms)':>9} {'recall':>8}")
+                  f"{'p95(ms)':>9} {'recall':>8} {'index_used':>11}")
         print(header)
         print("-" * len(header))
         for r in sweep_results:
             print(f"{r['m']:>4} {r['ef_construction']:>10} {r['ef_search']:>10} "
                   f"{r['build_time_sec']:>9} {r['index_size_pretty']:>10} "
                   f"{r['latency']['p50_ms']:>9} {r['latency']['p95_ms']:>9} "
-                  f"{r['recall']*100:>7.1f}%")
+                  f"{r['recall']*100:>7.1f}% {str(r['index_used']):>11}")
 
     finally:
         await conn.close()
